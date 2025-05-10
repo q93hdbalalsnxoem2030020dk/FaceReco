@@ -906,8 +906,8 @@ if __name__ == "__main__":
     tool = OSINTTool()
     
     # Example: Search for a person by name and face image
-    person_name = "John Smith"  # Replace with actual name
-    face_image = "path/to/face_image.jpg"  # Replace with actual image path
+    person_name = "vannesa octavia"  # Replace with actual name
+    face_image = "face_example.jpg"  # Replace with actual image path
     
     # Run the OSINT analysis
     results = tool.analyze_person(person_name, face_image)

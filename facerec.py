@@ -1,398 +1,548 @@
 import requests
 import face_recognition
-import cv2
-import os
-import re
-import time
-import threading
 import concurrent.futures
+import os
+import time
+import re
+import random
+import json
 from bs4 import BeautifulSoup
-from PIL import Image
+from urllib.parse import quote_plus, urljoin
+from PIL import Image, ImageEnhance
 from io import BytesIO
-from urllib.parse import quote_plus, urlparse
 from fake_useragent import UserAgent
-from collections import defaultdict
 
-class PersonInfoScanner:
+class PersonSearcher:
     def __init__(self):
         self.ua = UserAgent()
-        self.lock = threading.Lock()
-        self.results = defaultdict(set)
-        self.face_encodings = []
-        self.platforms = {
-            'google': self._search_google,
-            'duckduckgo': self._search_duckduckgo
-        }
-        self.possible_info = {
-            'names': set(),
+        self.search_results = {
+            'name': None,
+            'verified_name': None,
             'gender': None,
-            'emails': set(),
-            'phones': set(),
-            'birth_info': set(),
-            'nationality': set(),
-            'social_media': defaultdict(set)
+            'email': None,
+            'phone': None,
+            'birth_info': None,
+            'origin': None,
+            'social_media': {},
+            'other_info': {},
+            'matched_faces': []
         }
-        
-    def _get_random_headers(self):
-        return {
+        self.social_platforms = [
+            'facebook.com', 'instagram.com', 'linkedin.com', 
+            'twitter.com', 'tiktok.com', 'youtube.com'
+        ]
+        self.search_engines = ['google', 'duckduckgo']
+        self.session = requests.Session()
+        self.session.headers.update({
             'User-Agent': self.ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept': 'text/html,application/xhtml+xml,application/xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
             'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
-    
-    def _load_face(self, image_path):
+            'Upgrade-Insecure-Requests': '1'
+        })
+
+    def get_random_proxy(self):
+        proxies = [
+            None,  # Sometimes use direct connection
+            {'http': 'http://127.0.0.1:8080', 'https': 'http://127.0.0.1:8080'},
+            {'http': 'http://127.0.0.1:8118', 'https': 'http://127.0.0.1:8118'},
+        ]
+        return random.choice(proxies)
+
+    def load_face_image(self, image_path):
         try:
-            image = face_recognition.load_image_file(image_path)
-            face_locations = face_recognition.face_locations(image)
-            if not face_locations:
-                print(f"No faces detected in {image_path}")
-                return False
+            if not os.path.exists(image_path):
+                print(f"Error: Image file not found at {image_path}")
+                return None
             
-            self.face_encodings = [face_recognition.face_encodings(image, [location])[0] 
-                                   for location in face_locations]
-            print(f"Loaded {len(self.face_encodings)} face(s) from image")
-            return True
+            image = face_recognition.load_image_file(image_path)
+            face_encodings = face_recognition.face_encodings(image)
+            
+            if not face_encodings:
+                print("No faces detected in the image. Attempting image enhancement...")
+                enhanced_image = self.enhance_image(image_path)
+                face_encodings = face_recognition.face_encodings(enhanced_image)
+                
+                if not face_encodings:
+                    print("Still no faces detected after enhancement. Please try with a clearer image.")
+                    return None
+                
+            return face_encodings[0]  # Return the first face encoding
         except Exception as e:
             print(f"Error loading face image: {e}")
-            return False
-    
-    def _search_google(self, query, is_face_search=False):
-        search_url = f"https://www.google.com/search?q={quote_plus(query)}"
-        if is_face_search:
-            search_url += "&tbm=isch"
+            return None
+
+    def enhance_image(self, image_path):
+        try:
+            img = Image.open(image_path)
+            
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.5)
+            
+            enhancer = ImageEnhance.Brightness(img)
+            img = enhancer.enhance(1.2)
+            
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(2.0)
+            
+            enhanced_path = f"enhanced_{os.path.basename(image_path)}"
+            img.save(enhanced_path)
+            
+            return face_recognition.load_image_file(enhanced_path)
+        except Exception as e:
+            print(f"Error enhancing image: {e}")
+            return face_recognition.load_image_file(image_path)
+
+    def search_by_name(self, name, search_engine, worker_id):
+        if search_engine == 'google':
+            return self.search_google(name, worker_id)
+        elif search_engine == 'duckduckgo':
+            return self.search_duckduckgo(name, worker_id)
+        return []
+
+    def search_google(self, name, worker_id):
+        print(f"Worker {worker_id}: Searching Google for {name}")
+        query = quote_plus(name)
+        urls = []
         
         try:
-            response = requests.get(search_url, headers=self._get_random_headers(), timeout=10)
+            search_url = f"https://www.google.com/search?q={query}"
+            response = self.session.get(
+                search_url, 
+                headers={'User-Agent': self.ua.random},
+                proxies=self.get_random_proxy(),
+                timeout=10
+            )
+            
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                if is_face_search:
-                    img_elements = soup.find_all('img')
-                    for img in img_elements[1:]:  # Skip Google logo
-                        if img.get('src') and img['src'].startswith('http'):
-                            try:
-                                img_response = requests.get(img['src'], headers=self._get_random_headers(), timeout=5)
-                                if img_response.status_code == 200:
-                                    img_data = BytesIO(img_response.content)
-                                    unknown_image = face_recognition.load_image_file(img_data)
-                                    unknown_face_locations = face_recognition.face_locations(unknown_image)
-                                    
-                                    if unknown_face_locations:
-                                        unknown_encodings = face_recognition.face_encodings(unknown_image, unknown_face_locations)
-                                        for unknown_encoding in unknown_encodings:
-                                            matches = face_recognition.compare_faces(self.face_encodings, unknown_encoding, tolerance=0.6)
-                                            if any(matches):
-                                                parent = img.parent
-                                                if parent:
-                                                    link = parent.get('href')
-                                                    if link:
-                                                        self._extract_info_from_url(link)
-                            except Exception as e:
-                                continue
-                else:
-                    links = soup.find_all('a')
-                    for link in links:
-                        href = link.get('href')
-                        if href and href.startswith('/url?q='):
-                            url = href.split('/url?q=')[1].split('&')[0]
-                            self._extract_info_from_url(url)
-                            
-                # Extract text data
-                text_content = soup.get_text()
-                self._extract_patterns_from_text(text_content)
+                for link in soup.select('a[href]'):
+                    href = link.get('href', '')
+                    if href.startswith('/url?q='):
+                        url = href.split('/url?q=')[1].split('&')[0]
+                        if any(platform in url for platform in self.social_platforms):
+                            urls.append(url)
+                
+                for result in soup.select('div.g'):
+                    result_text = result.get_text().lower()
+                    self.extract_personal_info(result_text, name)
+                    
+                image_search_url = f"https://www.google.com/search?q={query}&tbm=isch"
+                img_response = self.session.get(
+                    image_search_url,
+                    headers={'User-Agent': self.ua.random},
+                    proxies=self.get_random_proxy(),
+                    timeout=10
+                )
+                
+                if img_response.status_code == 200:
+                    soup = BeautifulSoup(img_response.text, 'html.parser')
+                    img_elements = soup.select('img')
+                    
+                    for img in img_elements[1:10]:  # Skip Google logo, take next 9
+                        src = img.get('src', '')
+                        if src.startswith('http') and 'gif' not in src.lower():
+                            urls.append(src)
             
+            time.sleep(random.uniform(1, 3))  # Avoid rate limiting
         except Exception as e:
-            print(f"Error in Google search: {e}")
-    
-    def _search_duckduckgo(self, query, is_face_search=False):
-        search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-        if is_face_search:
-            search_url += " images"
+            print(f"Worker {worker_id}: Error searching Google: {e}")
+        
+        return urls
+
+    def search_duckduckgo(self, name, worker_id):
+        print(f"Worker {worker_id}: Searching DuckDuckGo for {name}")
+        query = quote_plus(name)
+        urls = []
         
         try:
-            response = requests.get(search_url, headers=self._get_random_headers(), timeout=10)
+            search_url = f"https://duckduckgo.com/html/?q={query}"
+            response = self.session.get(
+                search_url,
+                headers={'User-Agent': self.ua.random},
+                proxies=self.get_random_proxy(),
+                timeout=10
+            )
+            
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                links = soup.find_all('a', {'class': 'result__url'})
-                for link in links:
-                    href = link.get('href')
-                    if href:
-                        self._extract_info_from_url(href)
+                for link in soup.select('a.result__a'):
+                    href = link.get('href', '')
+                    if any(platform in href for platform in self.social_platforms):
+                        urls.append(href)
                 
-                # Extract text data
-                text_content = soup.get_text()
-                self._extract_patterns_from_text(text_content)
-                
-                if is_face_search:
-                    # For DuckDuckGo, we need to make a separate request for images
-                    img_search_url = f"https://duckduckgo.com/i.js?q={quote_plus(query)}&o=json"
-                    try:
-                        img_response = requests.get(img_search_url, headers=self._get_random_headers(), timeout=10)
-                        if img_response.status_code == 200 and 'json' in img_response.headers.get('content-type', ''):
-                            data = img_response.json()
-                            for result in data.get('results', []):
-                                try:
-                                    img_url = result.get('image')
-                                    if img_url:
-                                        img_response = requests.get(img_url, headers=self._get_random_headers(), timeout=5)
-                                        if img_response.status_code == 200:
-                                            img_data = BytesIO(img_response.content)
-                                            unknown_image = face_recognition.load_image_file(img_data)
-                                            unknown_face_locations = face_recognition.face_locations(unknown_image)
-                                            
-                                            if unknown_face_locations:
-                                                unknown_encodings = face_recognition.face_encodings(unknown_image, unknown_face_locations)
-                                                for unknown_encoding in unknown_encodings:
-                                                    matches = face_recognition.compare_faces(self.face_encodings, unknown_encoding, tolerance=0.6)
-                                                    if any(matches):
-                                                        source_url = result.get('url')
-                                                        if source_url:
-                                                            self._extract_info_from_url(source_url)
-                                except Exception as e:
-                                    continue
-                    except Exception as e:
-                        print(f"Error in DuckDuckGo image search: {e}")
+                for result in soup.select('div.result'):
+                    result_text = result.get_text().lower()
+                    self.extract_personal_info(result_text, name)
             
+            time.sleep(random.uniform(1, 3))  # Avoid rate limiting
         except Exception as e:
-            print(f"Error in DuckDuckGo search: {e}")
-    
-    def _extract_info_from_url(self, url):
+            print(f"Worker {worker_id}: Error searching DuckDuckGo: {e}")
+        
+        return urls
+
+    def search_social_media(self, name, platform, worker_id):
+        print(f"Worker {worker_id}: Searching {platform} for {name}")
+        results = []
+        
         try:
-            response = requests.get(url, headers=self._get_random_headers(), timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                text_content = soup.get_text()
-                self._extract_patterns_from_text(text_content)
-                
-                # Check for social media links
-                social_patterns = {
-                    'facebook': r'facebook\.com/([^/"\']+)',
-                    'twitter': r'twitter\.com/([^/"\']+)',
-                    'instagram': r'instagram\.com/([^/"\']+)',
-                    'linkedin': r'linkedin\.com/in/([^/"\']+)',
-                    'github': r'github\.com/([^/"\']+)'
-                }
-                
-                for platform, pattern in social_patterns.items():
-                    matches = re.findall(pattern, response.text)
-                    for match in matches:
-                        if match and len(match) > 1 and not match.startswith(('img', 'static', 'assets', 'js', 'css')):
-                            with self.lock:
-                                self.possible_info['social_media'][platform].add(match)
-        
-        except Exception as e:
-            pass
-    
-    def _extract_patterns_from_text(self, text):
-        # Extract potential names (capitalized words next to each other)
-        name_pattern = r'\b[A-Z][a-z]+ [A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b'
-        names = re.findall(name_pattern, text)
-        
-        # Extract emails
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
-        
-        # Extract phone numbers (various formats)
-        phone_pattern = r'\b(?:\+\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?(?:\d{3}[-.\s]?\d{4})\b'
-        phones = re.findall(phone_pattern, text)
-        
-        # Extract birth information
-        birth_pattern = r'(?:born|birth|birthday)(?:[\s:]+)([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?[,\s]+\d{4}|\d{1,2}(?:st|nd|rd|th)?[,\s]+[A-Za-z]+[,\s]+\d{4}|\d{4})'
-        birth_info = re.findall(birth_pattern, text, re.IGNORECASE)
-        
-        # Extract nationality/origin
-        origin_pattern = r'(?:from|nationality|origin|born in)(?:[\s:]+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'
-        origins = re.findall(origin_pattern, text, re.IGNORECASE)
-        
-        # Gender detection
-        male_indicators = re.findall(r'\b(?:he|him|his|male|man|boy|gentleman|mr\.?|mister)\b', text.lower())
-        female_indicators = re.findall(r'\b(?:she|her|hers|female|woman|girl|lady|ms\.?|mrs\.?|miss)\b', text.lower())
-        
-        with self.lock:
-            for name in names:
-                self.possible_info['names'].add(name)
-            
-            for email in emails:
-                self.possible_info['emails'].add(email)
-                
-            for phone in phones:
-                self.possible_info['phones'].add(phone)
-                
-            for info in birth_info:
-                self.possible_info['birth_info'].add(info.strip())
-                
-            for origin in origins:
-                self.possible_info['nationality'].add(origin.strip())
-            
-            # Simple gender determination
-            if not self.possible_info['gender']:
-                male_count = len(male_indicators)
-                female_count = len(female_indicators)
-                
-                if male_count > female_count * 2:  # Ensure strong confidence
-                    self.possible_info['gender'] = 'Male'
-                elif female_count > male_count * 2:
-                    self.possible_info['gender'] = 'Female'
-    
-    def worker(self, platform, query, is_face_search=False):
-        search_function = self.platforms.get(platform)
-        if search_function:
-            search_function(query, is_face_search)
-    
-    def search(self, name, face_path):
-        if not self._load_face(face_path):
-            return "Failed to load face image. Please ensure the image contains a clearly visible face."
-        
-        queries = [
-            name,
-            f"{name} profile",
-            f"{name} contact",
-            f"{name} about",
-            f"{name} information",
-            f"{name} social media"
-        ]
-        
-        # Create thread pools
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            # Submit face search tasks (3 workers per platform)
-            face_futures = []
-            for platform in self.platforms:
-                for _ in range(3):
-                    face_futures.append(executor.submit(self.worker, platform, name, True))
-            
-            # Submit text search tasks (3 workers per platform)
-            text_futures = []
-            for platform in self.platforms:
-                for query in queries:
-                    text_futures.append(executor.submit(self.worker, platform, query, False))
-            
-            # Wait for all tasks to complete
-            concurrent.futures.wait(face_futures + text_futures)
-        
-        # Compile results
-        return self._compile_results()
-    
-    def _compile_results(self):
-        results = {}
-        
-        # Verify name matches
-        search_name_parts = self.input_name.lower().split()
-        verified_names = []
-        
-        for name in self.possible_info['names']:
-            name_parts = name.lower().split()
-            matches = sum(p in name_parts for p in search_name_parts)
-            if matches / max(len(search_name_parts), len(name_parts)) >= 0.5:  # At least 50% match
-                verified_names.append(name)
-        
-        # Get most common name
-        if verified_names:
-            name_count = defaultdict(int)
-            for name in verified_names:
-                name_count[name] += 1
-            most_common_name = max(name_count.items(), key=lambda x: x[1])[0]
-            results["Real Name (verified)"] = most_common_name
-        else:
-            results["Real Name"] = "Unknown"
-        
-        # Add gender if found
-        if self.possible_info['gender']:
-            results["Gender"] = self.possible_info['gender']
-        else:
-            results["Gender"] = "Unknown"
-        
-        # Add emails if found
-        if self.possible_info['emails']:
-            results["Email(s)"] = list(self.possible_info['emails'])
-        else:
-            results["Email"] = "Not found"
-        
-        # Add phones if found
-        if self.possible_info['phones']:
-            results["Phone Number(s)"] = list(self.possible_info['phones'])
-        else:
-            results["Phone"] = "Not found"
-        
-        # Add birth info if found
-        if self.possible_info['birth_info']:
-            results["Birth Information"] = list(self.possible_info['birth_info'])
-        else:
-            results["Birth Information"] = "Not found"
-        
-        # Add nationality if found
-        if self.possible_info['nationality']:
-            results["Nationality/Origin"] = list(self.possible_info['nationality'])
-        else:
-            results["Nationality/Origin"] = "Not found"
-        
-        # Add social media
-        if self.possible_info['social_media']:
-            social_results = {}
-            for platform, usernames in self.possible_info['social_media'].items():
-                if usernames:
-                    social_results[platform] = list(usernames)
-            
-            if social_results:
-                results["Social Media"] = social_results
+            if platform == 'facebook.com':
+                search_url = f"https://www.facebook.com/public/{name.replace(' ', '-')}"
+            elif platform == 'instagram.com':
+                search_url = f"https://www.instagram.com/explore/tags/{name.replace(' ', '')}"
+            elif platform == 'linkedin.com':
+                search_url = f"https://www.linkedin.com/pub/dir?firstName={name.split()[0]}&lastName={name.split()[-1]}"
+            elif platform == 'twitter.com':
+                search_url = f"https://twitter.com/search?q={quote_plus(name)}&src=typed_query"
+            elif platform == 'tiktok.com':
+                search_url = f"https://www.tiktok.com/search?q={quote_plus(name)}"
+            elif platform == 'youtube.com':
+                search_url = f"https://www.youtube.com/results?search_query={quote_plus(name)}"
             else:
-                results["Social Media"] = "Not found"
-        else:
-            results["Social Media"] = "Not found"
+                return results
+            
+            response = self.session.get(
+                search_url,
+                headers={'User-Agent': self.ua.random},
+                proxies=self.get_random_proxy(),
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                if platform == 'facebook.com':
+                    profiles = soup.select('div.x1qlqyl8')
+                    for profile in profiles[:3]:
+                        name_elem = profile.select_one('span')
+                        if name_elem:
+                            profile_name = name_elem.get_text().strip()
+                            profile_url = profile.select_one('a')
+                            if profile_url:
+                                results.append({
+                                    'platform': 'Facebook',
+                                    'name': profile_name,
+                                    'url': urljoin('https://facebook.com', profile_url.get('href', ''))
+                                })
+                
+                elif platform == 'instagram.com':
+                    profiles = soup.select('div._aagu')
+                    for profile in profiles[:3]:
+                        img = profile.select_one('img')
+                        if img:
+                            img_url = img.get('src', '')
+                            if img_url:
+                                results.append({
+                                    'platform': 'Instagram',
+                                    'image_url': img_url
+                                })
+                
+                elif platform == 'linkedin.com':
+                    profiles = soup.select('li.reusable-search__result-container')
+                    for profile in profiles[:3]:
+                        name_elem = profile.select_one('span.entity-result__title-text')
+                        if name_elem:
+                            profile_name = name_elem.get_text().strip()
+                            profile_url = profile.select_one('a.app-aware-link')
+                            if profile_url:
+                                results.append({
+                                    'platform': 'LinkedIn',
+                                    'name': profile_name,
+                                    'url': profile_url.get('href', '')
+                                })
+                
+                elif platform == 'twitter.com':
+                    profiles = soup.select('div[data-testid="cellInnerDiv"]')
+                    for profile in profiles[:3]:
+                        name_elem = profile.select_one('div[data-testid="User-Name"]')
+                        if name_elem:
+                            profile_name = name_elem.get_text().strip()
+                            results.append({
+                                'platform': 'Twitter',
+                                'name': profile_name
+                            })
+                
+                elif platform in ['tiktok.com', 'youtube.com']:
+                    img_elements = soup.select('img')
+                    for img in img_elements[:5]:
+                        img_url = img.get('src', '')
+                        if img_url and img_url.startswith('http'):
+                            results.append({
+                                'platform': 'TikTok' if platform == 'tiktok.com' else 'YouTube',
+                                'image_url': img_url
+                            })
+            
+            time.sleep(random.uniform(2, 4))  # Avoid rate limiting
+        except Exception as e:
+            print(f"Worker {worker_id}: Error searching {platform}: {e}")
         
         return results
 
-    def run(self):
-        self.input_name = input("Enter person's full name (all lowercase): ").strip()
-        face_path = input("Enter path to face image (in current folder): ").strip()
+    def extract_personal_info(self, text, name):
+        text = text.lower()
+        name_parts = name.split()
         
-        # Make sure we're using a path in the current directory
-        if os.path.dirname(face_path):
-            print("Please provide just the filename in the current directory.")
-            return
+        if not self.search_results['verified_name']:
+            name_pattern = r'(?:name|full name|real name)[:\s]+([a-zA-Z\s]+)'
+            name_match = re.search(name_pattern, text)
+            if name_match:
+                potential_name = name_match.group(1).strip().title()
+                if any(part in potential_name.lower() for part in name_parts):
+                    self.search_results['verified_name'] = potential_name
         
-        if not os.path.exists(face_path):
-            print(f"Error: Image file '{face_path}' not found in current directory.")
-            return
+        if not self.search_results['gender']:
+            if re.search(r'\b(he|his|him|male|man|boy|gentleman)\b', text):
+                self.search_results['gender'] = 'Male'
+            elif re.search(r'\b(she|her|hers|female|woman|girl|lady)\b', text):
+                self.search_results['gender'] = 'Female'
         
-        print(f"\nScanning for information about '{self.input_name}'...")
-        print(f"Using face image: {face_path}")
-        print("\nThis may take a few minutes. Scanning multiple sources...\n")
+        if not self.search_results['email']:
+            email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+            email_match = re.search(email_pattern, text)
+            if email_match:
+                potential_email = email_match.group(0)
+                if any(part in potential_email for part in name_parts):
+                    self.search_results['email'] = potential_email
         
-        start_time = time.time()
-        results = self.search(self.input_name, face_path)
-        end_time = time.time()
+        if not self.search_results['phone']:
+            phone_pattern = r'(\+\d{1,3}[-\.\s]?)?(\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4})'
+            phone_match = re.search(phone_pattern, text)
+            if phone_match:
+                self.search_results['phone'] = phone_match.group(0)
         
-        print(f"\nScan completed in {end_time - start_time:.2f} seconds.\n")
+        if not self.search_results['birth_info']:
+            birth_patterns = [
+                r'born (?:on|in)? (\w+ \d{1,2},? \d{4})',
+                r'born (?:on|in)? (\d{1,2} \w+ \d{4})',
+                r'born (?:on|in)? (\w+,? \d{4})',
+                r'born (?:on|in)? (\d{4})',
+                r'birthdate:? (\w+ \d{1,2},? \d{4})',
+                r'birth date:? (\w+ \d{1,2},? \d{4})',
+                r'date of birth:? (\w+ \d{1,2},? \d{4})'
+            ]
+            
+            for pattern in birth_patterns:
+                birth_match = re.search(pattern, text)
+                if birth_match:
+                    self.search_results['birth_info'] = birth_match.group(1)
+                    break
         
-        if isinstance(results, str):
-            print(results)  # Error message
-            return
+        if not self.search_results['origin']:
+            origin_patterns = [
+                r'(?:born|from|originates?) (?:in|from) ([A-Za-z\s]+)',
+                r'nationality:? ([A-Za-z\s]+)',
+                r'origin:? ([A-Za-z\s]+)',
+                r'citizen of ([A-Za-z\s]+)'
+            ]
+            
+            for pattern in origin_patterns:
+                origin_match = re.search(pattern, text)
+                if origin_match:
+                    origin = origin_match.group(1).strip()
+                    if len(origin) > 2 and origin.lower() not in ['in', 'on', 'at', 'the']:
+                        self.search_results['origin'] = origin.title()
+                        break
+
+    def compare_face_with_url(self, face_encoding, image_url, worker_id):
+        try:
+            response = self.session.get(
+                image_url, 
+                headers={'User-Agent': self.ua.random},
+                stream=True,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                try:
+                    img = Image.open(BytesIO(response.content))
+                    img_path = f"temp_face_{worker_id}_{int(time.time())}.jpg"
+                    img.save(img_path)
+                    
+                    unknown_image = face_recognition.load_image_file(img_path)
+                    unknown_face_encodings = face_recognition.face_encodings(unknown_image)
+                    
+                    if unknown_face_encodings:
+                        matches = face_recognition.compare_faces([face_encoding], unknown_face_encodings[0], tolerance=0.6)
+                        if matches[0]:
+                            face_distance = face_recognition.face_distance([face_encoding], unknown_face_encodings[0])[0]
+                            confidence = 1 - face_distance
+                            
+                            if confidence > 0.5:
+                                result = {
+                                    'url': image_url,
+                                    'confidence': float(confidence),
+                                    'match': True
+                                }
+                                self.search_results['matched_faces'].append(result)
+                                print(f"Worker {worker_id}: Face match found! Confidence: {confidence:.2f}")
+                                return result
+                    
+                    os.remove(img_path)
+                except Exception as e:
+                    print(f"Worker {worker_id}: Error processing image: {e}")
+        except Exception as e:
+            print(f"Worker {worker_id}: Error downloading image: {e}")
         
-        print("=" * 50)
-        print("INFORMATION FOUND:")
-        print("=" * 50)
+        return None
+
+    def worker_task(self, worker_id, name, face_encoding, search_type):
+        results = []
         
-        for key, value in results.items():
-            if isinstance(value, list):
-                print(f"{key}:")
-                for item in value[:5]:  # Limit to top 5 results per category
-                    print(f"  - {item}")
-            elif isinstance(value, dict):
-                print(f"{key}:")
-                for platform, usernames in value.items():
-                    print(f"  {platform.capitalize()}:")
-                    for username in list(usernames)[:3]:  # Limit to top 3 results per platform
-                        print(f"    - {username}")
-            else:
-                print(f"{key}: {value}")
+        if search_type == 'name_search':
+            engine = self.search_engines[worker_id % len(self.search_engines)]
+            urls = self.search_by_name(name, engine, worker_id)
+            results.extend(urls)
+            
+        elif search_type == 'social_search':
+            platform_index = worker_id % len(self.social_platforms)
+            platform = self.social_platforms[platform_index]
+            social_results = self.search_social_media(name, platform, worker_id)
+            
+            for result in social_results:
+                if 'url' in result:
+                    results.append(result['url'])
+                if 'image_url' in result:
+                    results.append(result['image_url'])
+                
+                if 'platform' in result and 'name' in result:
+                    if result['platform'] not in self.search_results['social_media']:
+                        self.search_results['social_media'][result['platform']] = []
+                    
+                    self.search_results['social_media'][result['platform']].append({
+                        'name': result.get('name', ''),
+                        'url': result.get('url', '')
+                    })
         
-        print("\nNote: Some information may be inaccurate. Verify results independently.")
+        elif search_type == 'face_search' and face_encoding is not None:
+            for url in results:
+                if url.startswith('http') and any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    self.compare_face_with_url(face_encoding, url, worker_id)
+        
         return results
+
+    def search_person(self, name, image_path):
+        self.search_results['name'] = name
+        face_encoding = self.load_face_image(image_path)
+        all_urls = []
+        
+        print(f"Starting search for {name} with image: {image_path}")
+        
+        if face_encoding is None:
+            print("Warning: Unable to detect a face in the provided image.")
+            print("Continuing search based on name only...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            thread_futures = []
+            
+            for thread_id in range(2):
+                future = executor.submit(
+                    self.process_thread_tasks, thread_id, name, face_encoding
+                )
+                thread_futures.append(future)
+            
+            for future in concurrent.futures.as_completed(thread_futures):
+                urls = future.result()
+                all_urls.extend(urls)
+        
+        if face_encoding is not None and all_urls:
+            print("Performing facial recognition on discovered images...")
+            image_urls = [url for url in all_urls if url.startswith('http') and any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp'])]
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as face_executor:
+                face_futures = []
+                
+                for i, url in enumerate(image_urls):
+                    future = face_executor.submit(
+                        self.compare_face_with_url, face_encoding, url, i
+                    )
+                    face_futures.append(future)
+                
+                concurrent.futures.wait(face_futures)
+        
+        return self.search_results
+
+    def process_thread_tasks(self, thread_id, name, face_encoding):
+        thread_urls = []
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=3) as worker_executor:
+            worker_futures = []
+            
+            for worker_id in range(3):
+                global_worker_id = thread_id * 3 + worker_id
+                
+                if global_worker_id < 3:
+                    search_type = 'name_search'
+                elif global_worker_id < 6:
+                    search_type = 'social_search'
+                
+                future = worker_executor.submit(
+                    self.worker_task, global_worker_id, name, face_encoding, search_type
+                )
+                worker_futures.append(future)
+            
+            for future in concurrent.futures.as_completed(worker_futures):
+                urls = future.result()
+                thread_urls.extend(urls)
+        
+        return thread_urls
+
+    def process_results(self):
+        if not self.search_results['verified_name']:
+            self.search_results['verified_name'] = self.search_results['name'].title()
+            
+        self.search_results['matched_faces'].sort(key=lambda x: x.get('confidence', 0), reverse=True)
+        
+        if self.search_results['matched_faces']:
+            print(f"\nFound {len(self.search_results['matched_faces'])} face matches")
+            best_match = self.search_results['matched_faces'][0]
+            print(f"Best match confidence: {best_match['confidence']:.2f}")
+        else:
+            print("\nNo face matches found")
+            
+        print("\nInformation found:")
+        for key, value in self.search_results.items():
+            if key != 'matched_faces' and value:
+                if key == 'social_media':
+                    print(f"- Social Media Profiles:")
+                    for platform, profiles in value.items():
+                        print(f"  * {platform}: {len(profiles)} potential profiles")
+                else:
+                    print(f"- {key.replace('_', ' ').title()}: {value}")
+        
+        return self.search_results
+
+
+def main():
+    searcher = PersonSearcher()
+    
+    print("=" * 60)
+    print("   Person Information Search Tool using Face Recognition")
+    print("=" * 60)
+    
+    name = input("\nEnter the person's full name (all lowercase): ").strip().lower()
+    image_path = input("\nEnter the path to the face image (in current folder): ").strip()
+    
+    if not image_path.startswith('/'):
+        image_path = f"./{image_path}"
+    
+    print("\nStarting search with 6 workers and 2 threads...")
+    print("This may take several minutes. Please wait...\n")
+    
+    start_time = time.time()
+    results = searcher.search_person(name, image_path)
+    searcher.process_results()
+    
+    output_file = f"{name.replace(' ', '_')}_search_results.json"
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nSearch completed in {elapsed_time:.2f} seconds")
+    print(f"Results saved to {output_file}")
 
 if __name__ == "__main__":
-    scanner = PersonInfoScanner()
-    scanner.run()
+    main()
